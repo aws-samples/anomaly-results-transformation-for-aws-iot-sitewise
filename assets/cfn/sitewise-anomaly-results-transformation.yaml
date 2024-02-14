@@ -1,0 +1,549 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Provisions Cloud9, Ignition, Grafana instances and other miscellaneous resources such as IAM Role, IAM Policy etc. 
+
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - 
+        Label: 
+          default: "Lambda Layer for Boto3 1.34.34 version"
+        Parameters: 
+          - S3BucketName
+          - S3Key
+      - 
+        Label: 
+          default: "Asset model configuration"
+        Parameters: 
+          - AssetModelIDs
+Parameters:
+  S3BucketName:
+    Default: ""
+    Description: "Name of the S3 bucket where the Lambda layer zip file is uploaded. For e.g., myS3bucket"
+    Type: String
+  S3Key:
+    Default: ""
+    Description: "S3 key for the uploaded Lambda layer zip file. For e.g., files/boto3-1.34.34.zip"
+    Type: String
+  AssetModelIDs:
+    Default: ""
+    Description: "Comma delimited asset model IDs to be considered. For e.g., 54ff10fb-49ac-4657-a4e8-dde8f6db05d7,3b8fff70-b7cd-4cd6-b074-0028bc137597"
+    Type: CommaDelimitedList
+
+Resources:
+  AnomalyPropertiesConfiguratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'Anomaly_Configurator-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - "lambda.amazonaws.com"
+          Action:
+          - sts:AssumeRole
+      Policies: 
+        - PolicyName: Anomaly_Configurator_Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - iotsitewise:ListAssetModels
+                  - iotsitewise:ListAssetModelProperties
+                  - iotsitewise:ListAssets
+                  - iotsitewise:DescribeAssetModel
+                  - iotsitewise:DescribeAssetModelCompositeModel
+                  - iotsitewise:UpdateAssetModel
+                  - iotsitewise:UpdateAssetProperty
+                  - iot:CreateTopicRule
+                  - iam:PassRole
+                Resource: '*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  AnomalyTransformerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'Anomaly_Transformer-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - "lambda.amazonaws.com"
+          Action:
+          - sts:AssumeRole
+      Policies: 
+        - PolicyName: Anomaly_Results_Transformer_Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - iotsitewise:DescribeAssetProperty
+                  - iotsitewise:BatchPutAssetPropertyValue
+                Resource: '*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  IoTRulesErrorActionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'Rules_Error-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - "iot.amazonaws.com"
+          Action:
+          - sts:AssumeRole
+      Policies: 
+        - PolicyName: IoT_Rules_Error_Action_Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - iot:Publish
+                Resource: '*'
+  AnomalyPropertiesConfiguratorCustomResource:
+    Type: Custom::ConfiguratorLambda
+    Properties:
+      ServiceToken:
+        Fn::GetAtt:
+        - AnomalyPropertiesConfiguratorLambda
+        - Arn
+      AssetModelIDList:
+        Ref: AssetModelIDs
+  AnomalyResultsTransformerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+          # SPDX-License-Identifier: MIT-0
+
+          import boto3
+          import json
+
+          client = boto3.client('iotsitewise')
+
+          def get_property_name_from_id(asset_id, property_id):
+              response = client.describe_asset_property(
+              assetId=asset_id,
+              propertyId=property_id
+              )
+              return response["assetProperty"]["name"]
+
+          def make_batch_put_call(batch_put_values, asset_id, transformed_prediction_property_id, transformed_prediction_factors_property_id):
+              prediction_property_values = []
+              prediction_factors_property_values = []
+              
+              for item in batch_put_values:
+                prediction_property_values.append(
+                { 
+                  "timestamp": { 
+                      "timeInSeconds": item["timeInSeconds"]
+                  },
+                  "value": { 
+                      "stringValue": item["prediction"]
+                  }
+                })
+                prediction_factors_property_values.append(
+                { 
+                  "timestamp": { 
+                      "timeInSeconds": item["timeInSeconds"]
+                  },
+                  "value": { 
+                      "stringValue": json.dumps(item["predictionFactors"])
+                  }
+                })
+                
+              batch_put_payload = [ 
+                { 
+                  "assetId": asset_id,
+                  "propertyId": transformed_prediction_property_id,
+                  "entryId": "1",
+                  "propertyValues": prediction_property_values
+                },
+                { 
+                  "assetId": asset_id,
+                  "propertyId": transformed_prediction_factors_property_id,
+                  "entryId": "2",
+                  "propertyValues": prediction_factors_property_values
+                }
+                ]
+              response = client.batch_put_asset_property_value(entries=batch_put_payload)
+              print("Made a batch put call")
+
+          def prepare_batch_put_values(values, asset_id):
+              batch_put_values = []
+
+              for item in values:
+                time_seconds = item["timeInSeconds"]
+                json_string_value = item["stringValue"]
+                result = json.loads(json_string_value)
+                prediction_reason = result["prediction_reason"]
+                
+                diagnostics = result["diagnostics"]
+                diagnostics_enriched = {}
+
+                for item in diagnostics:
+                    property_id = item["name"].split('\\')[0]
+                    property_name = get_property_name_from_id(asset_id, property_id)
+                    diagnostics_enriched[property_name] = item["value"]
+
+                batch_put_values.append(
+                    { 
+                      "timeInSeconds": time_seconds,
+                      "prediction": prediction_reason,
+                      "predictionFactors": diagnostics_enriched
+                    })
+              return batch_put_values
+
+          def lambda_handler(event, context):
+              values = event["values"]
+              asset_id = event["assetId"]
+              transformed_prediction_property_id = event["transformedPredictionPropertyId"]
+              transformed_prediction_factors_property_id = event["transformedPredictionFactorsPropertyId"]
+              print(f'Asset Id: {asset_id}, Prediction Property Id: {transformed_prediction_property_id}, Prediction Factors Property Id: {transformed_prediction_factors_property_id}')
+              print(f'Total TVQs received: {len(values)}')
+              
+              batch_put_values = prepare_batch_put_values(values, asset_id)
+              make_batch_put_call(batch_put_values, asset_id, transformed_prediction_property_id, transformed_prediction_factors_property_id)
+
+      FunctionName: !Sub 'anomaly_results_transformer-${AWS::StackName}'
+      MemorySize: 128
+      Role: !GetAtt AnomalyTransformerRole.Arn
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Timeout: 600
+  BotoLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: boto3-1-34-34
+      Description: Lambda Layer for Boto3 1.34.34 version
+      Content:
+        S3Bucket: !Sub ${S3BucketName}
+        S3Key: !Sub ${S3Key}
+      CompatibleRuntimes:
+        - python3.12
+  AnomalyPropertiesConfiguratorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+          # SPDX-License-Identifier: MIT-0
+
+          import time
+          import uuid
+          import boto3
+          import json
+          import traceback
+          import cfnresponse
+
+          sw_client = boto3.client('iotsitewise')
+          iot_client = boto3.client('iot')
+
+          ANOMALY_TRANSFORMER_LAMBDA_ARN = "${AnomalyResultsTransformerLambda.Arn}"
+          ERROR_ACTION_ROLE_ARN = "${IoTRulesErrorActionRole.Arn}"
+          SITEWISE_MQTT_ERROR_TOPIC = "sitewise/anomaly_detection/errors"
+
+          PREDICTION_PROPERTY_NAME_SUFFIX = "_prediction"
+          PREDICTION_FACTORS_PROPERTY_NAME_SUFFIX = "_prediction_factors"
+
+          IOT_RULE_SUFFIX = "_Anomaly_Transformer"
+
+          def enable_MQTT_notification(asset_id, property_id):
+              response = sw_client.update_asset_property(
+              assetId=asset_id,
+              propertyId=property_id,
+              propertyNotificationState='ENABLED')
+
+          def enable_MQTT_notification_all_assets(asset_model_id, property_id):
+              asset_ids = []
+              paginator = sw_client.get_paginator('list_assets')
+              page_iterator = paginator.paginate(
+                  assetModelId=asset_model_id,
+                  PaginationConfig={
+                      'MaxItems': 250,
+                      'PageSize': 250,
+                  })
+              for page in page_iterator:
+                  for asset_summary in page["assetSummaries"]:
+                      asset_ids.append(asset_summary["id"])
+              
+              if len(asset_ids) > 0: 
+                  print(f'\t\tEnabling MQTT notifications for AWS/L4E_ANOMALY_RESULT property on the following assets:')
+              else:
+                  print(f'\t\tSkipping MQTT notiticatiins as no assets found for asset model {asset_model_id}')
+                  
+              for asset_id in asset_ids:
+                  enable_MQTT_notification(asset_id, property_id)
+                  print(f'\t\t\t{asset_id}')
+                  
+
+          def wait_till_asset_model_active(asset_model_id):
+              while True:
+                  response = sw_client.describe_asset_model(assetModelId=asset_model_id, excludeProperties=True)
+                  model_state = response["assetModelStatus"]["state"]
+                  if model_state == "ACTIVE": 
+                      break
+                  elif model_state == "FAILED": 
+                      raise Exception("Model {asset_model_id} in FAILED state. Fix the model and run again.")
+                  time.sleep(5)
+
+          def generate_unique_property_uuid(asset_model_id):
+              while True:
+                  property_id = uuid.uuid4()
+                  uuid_unique = True
+                  paginator = sw_client.get_paginator('list_asset_model_properties')
+                  page_iterator = paginator.paginate(
+                      assetModelId=asset_model_id,
+                      PaginationConfig={
+                          'MaxItems': 250,
+                          'PageSize': 250,
+                      })
+                  for page in page_iterator:
+                      for asset_model_property_summary in page["assetModelPropertySummaries"]:
+                          if asset_model_property_summary["id"] == property_id: uuid_unique = False
+                  if uuid_unique: break
+                  time.sleep(1)
+              return property_id
+              
+          def get_all_asset_model_ids():
+              asset_model_ids = []
+              paginator = sw_client.get_paginator('list_asset_models')
+              
+              page_iterator = paginator.paginate(
+                  PaginationConfig={
+                      'MaxItems': 250,
+                      'PageSize': 250,
+                  }
+              )
+              for page in page_iterator:
+                  for asset_model_summary in page["assetModelSummaries"]:
+                      asset_model_ids.append(asset_model_summary["id"])
+              return asset_model_ids
+              
+          def has_prediction_definition(asset_model_id):
+              flag = False
+              response = sw_client.describe_asset_model(assetModelId=asset_model_id, excludeProperties=True)
+              if "assetModelCompositeModelSummaries" in response:
+                  for composite_model_summary in response["assetModelCompositeModelSummaries"]:
+                      if composite_model_summary["type"] == "AWS/L4E_ANOMALY":
+                          flag = True
+              return flag
+
+          def filter_models_with_prediction_definition(asset_model_ids):
+              filtered_asset_model_ids = []
+              for asset_model_id in asset_model_ids:
+                  if has_prediction_definition(asset_model_id): filtered_asset_model_ids.append(asset_model_id)
+              return filtered_asset_model_ids
+
+          def get_raw_anomaly_result_property_id(asset_model_id, asset_model_composite_model_id):
+              anomaly_result_property_id = None
+              response = sw_client.describe_asset_model_composite_model(assetModelId=asset_model_id, assetModelCompositeModelId=asset_model_composite_model_id)
+              composite_model_properties = response["assetModelCompositeModelProperties"]
+              for property in composite_model_properties:
+                  if property["name"] == "AWS/L4E_ANOMALY_RESULT":
+                      anomaly_result_property_id = property["id"]
+              return anomaly_result_property_id
+
+          def create_iot_rule(rule_name, topic, lambda_arn, error_action_role_arn,
+                              error_topic, prediction_property_id, prediction_factors_property_id):
+              response = iot_client.create_topic_rule(
+              ruleName= rule_name,
+              topicRulePayload={
+                  'sql': f'''SELECT payload.assetId, 
+                      "{prediction_property_id}" as transformedPredictionPropertyId,
+                      "{prediction_factors_property_id}" as transformedPredictionFactorsPropertyId,
+                        payload.values FROM "{topic}"''',
+                  'actions': [
+                      {
+                          'lambda': {
+                              'functionArn': f'{lambda_arn}'
+                          }
+                      }
+                  ],
+                  'errorAction': {
+                      'republish': {
+                          'roleArn': error_action_role_arn,
+                          'topic': error_topic,
+                          'qos': 1
+                      }
+                  }
+              })
+              
+          def process_prediction_properties(asset_model_ids):
+              # Iterate through each asset model
+              for asset_model_id in asset_model_ids:
+                  response = sw_client.describe_asset_model(assetModelId=asset_model_id, excludeProperties=False)
+                  asset_model_name = response["assetModelName"]
+                  print(f'Working on asset model: {asset_model_name}')
+                  # Iterate through each prediction definition
+                  for composite_model_summary in response["assetModelCompositeModelSummaries"]:
+                      if composite_model_summary["type"] == "AWS/L4E_ANOMALY":
+                          prediction_definition_name = composite_model_summary["name"]
+                          prediction_definition_id = composite_model_summary["id"]
+                          print(f'\tProcessing for prediction definition: {prediction_definition_name}')
+                          prediction_property_name = f'{prediction_definition_name}{PREDICTION_PROPERTY_NAME_SUFFIX}'
+                          prediction_factors_property_name = f'{prediction_definition_name}{PREDICTION_FACTORS_PROPERTY_NAME_SUFFIX}'
+                          
+                          properties = response["assetModelProperties"]
+                          property_names = [item["name"] for item in properties]
+                          
+                          # Prediction properties found
+                          if prediction_property_name in property_names or \
+                              prediction_factors_property_name in property_names:
+                                  print(f'\t\tPrediction properties already configured')
+                          # Prediction properties not found
+                          else:
+                              print(f'\t\tCreating new prediction properties')
+                              prediction_property_id = str(generate_unique_property_uuid(asset_model_id))
+                              prediction_factors_property_id = str(generate_unique_property_uuid(asset_model_id))
+                              properties.append(
+                                  {
+                                      'id': prediction_property_id,
+                                      'name': prediction_property_name,
+                                      'dataType': 'STRING',
+                                      'type': {
+                                          'measurement': {}
+                                      }
+                                  })
+                              properties.append(
+                                  {
+                                      'id': prediction_factors_property_id,
+                                      'name': prediction_factors_property_name,
+                                      'dataType': 'STRING',
+                                      'type': {
+                                          'measurement': {}
+                                      }
+                                  })
+                              # Create new prediction properties
+                              wait_till_asset_model_active(asset_model_id) # Ensure model is ready for an update
+                              sw_client.update_asset_model(
+                                  assetModelId=asset_model_id,
+                                  assetModelName=response["assetModelName"],
+                                  assetModelProperties=properties,
+                                  assetModelHierarchies=response["assetModelHierarchies"],
+                                  assetModelCompositeModels=response["assetModelCompositeModels"]
+                                  )
+                              
+                              time.sleep(2)
+                              wait_till_asset_model_active(asset_model_id)
+                              print(f'\t\tCreated two new prediction properties')
+                              print(f'\t\t\t{prediction_property_name}')
+                              print(f'\t\t\t{prediction_factors_property_name}')
+                              
+                              raw_anomaly_result_property_id = get_raw_anomaly_result_property_id(asset_model_id, prediction_definition_id)
+                              
+                              # Enable MQTT Notification
+                              enable_MQTT_notification_all_assets(asset_model_id, raw_anomaly_result_property_id)
+                              
+                              # Create IoT Rule
+                              rule_name = f'{asset_model_name}_{prediction_definition_name}{IOT_RULE_SUFFIX}'.replace(' ',"_")
+                              create_iot_rule(rule_name,
+                                  f'$aws/sitewise/asset-models/{asset_model_id}/assets/+/properties/{raw_anomaly_result_property_id}',
+                                  ANOMALY_TRANSFORMER_LAMBDA_ARN,
+                                  ERROR_ACTION_ROLE_ARN,
+                                  SITEWISE_MQTT_ERROR_TOPIC,
+                                  prediction_property_id,
+                                  prediction_factors_property_id
+                                  )
+                              print(f'\t\tCreated an IoT rule: {rule_name}')
+              
+          def lambda_handler(event, context):
+              EXPECTED_BOTO3_VERSION = "1.34.34"
+              boto3_version = boto3.__version__
+              if boto3_version == EXPECTED_BOTO3_VERSION:
+                  print(f'Found expected Boto3 version {boto3_version}')
+              else:
+                  raise Exception(f'Did not find expected Boto3 version, ensure that you are using a Lambda layer. Expected: {EXPECTED_BOTO3_VERSION}, Current: {boto3_version}')
+
+              print(f'event: {json.dumps(event)}')
+              print(f'context: {context}')
+              response_data = {}
+              status = cfnresponse.SUCCESS
+
+              asset_model_ids = event['ResourceProperties']['AssetModelIDList']
+
+              try:
+                  if event['RequestType'] == 'Delete':
+                      print('Deletion not supported yet through CloudFormation. You have to manually remove the resources.')
+                      response_data = {'Success': 'Deletion not supported yet through CloudFormation. You have to manually remove the resources.'}
+                      cfnresponse.send(event, context, status, response_data, 'CustomResourcePhysicalID')
+
+                  if event['RequestType'] == 'Create':
+                      print('Processing create request')
+
+                      asset_models_provided_count = len(asset_model_ids)
+              
+                      if asset_models_provided_count > 0 and asset_model_ids[0] != "":
+                          print(f'Provided {asset_models_provided_count} asset models, will only consider provided models\n')
+                      else:
+                          print(f'No asset models provided, will consider all asset models in the account')
+                          asset_model_ids = get_all_asset_model_ids()
+                          print(f'Total asset models in the account: {len(asset_model_ids)}\n')
+                          
+                      filtered_asset_model_ids = filter_models_with_prediction_definition(asset_model_ids)
+                      print(f'Asset models with atleast one prediction definition: {len(filtered_asset_model_ids)}\n')
+                      
+                      process_prediction_properties(filtered_asset_model_ids)
+                      
+                      print(f'\nScript execution completed successfully')
+
+                      response_data = {'Success': 'Successfully created required resources'}
+                      cfnresponse.send(event, context, status, response_data, 'CustomResourcePhysicalID')
+                      print(response_data)
+              except Exception as error:
+                  status = cfnresponse.FAILED
+                  error_msg = traceback.format_exc()
+                  print(error_msg)
+                  response_data = {'Error': error_msg}
+              finally:
+                  cfnresponse.send(event, context, status, response_data, 'CustomResourcePhysicalID')
+
+      FunctionName: !Sub 'anomaly_properties_configurator-${AWS::StackName}'
+      Layers:
+        - !Ref BotoLayer
+      MemorySize: 128
+      Role: !GetAtt AnomalyPropertiesConfiguratorRole.Arn
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Timeout: 600
+  AnomalyResultsTransformerLambdaIoTPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt AnomalyResultsTransformerLambda.Arn
+      Principal: iot.amazonaws.com
+      SourceArn: !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:rule/*
+  AnomalyConfiguratorLambdaIoTPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt AnomalyPropertiesConfiguratorLambda.Arn
+      Principal: iot.amazonaws.com
+      SourceArn: !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:rule/*
+
+Outputs:   
+  AnomalyPropertiesConfiguratorRoleARN:
+    Description: ARN of AnomalyPropertiesConfiguratorRole
+    Value: !GetAtt AnomalyPropertiesConfiguratorRole.Arn
+  AnomalyTransformerRoleARN:
+    Description: ARN of AnomalyTransformerRole
+    Value: !GetAtt AnomalyTransformerRole.Arn
+  IoTRulesErrorActionRoleARN:
+    Description: ARN of IoTRulesErrorActionRole
+    Value: !GetAtt IoTRulesErrorActionRole.Arn
+  AnomalyResultsTransformerLambdaARN:
+    Description: ARN of AnomalyResultsTransformerLambda
+    Value: !GetAtt AnomalyResultsTransformerLambda.Arn
+  AnomalyPropertiesConfiguratorLambdaARN:
+    Description: ARN of AnomalyPropertiesConfiguratorLambda
+    Value: !GetAtt AnomalyPropertiesConfiguratorLambda.Arn
